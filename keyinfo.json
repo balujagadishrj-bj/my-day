@@ -1,0 +1,13 @@
+{
+ "v": 1,
+ "kdf": "PBKDF2-SHA256",
+ "iterations": 310000,
+ "salt": "G1Npzae+DHh+ezBnyPKEtA==",
+ "repo": "balujagadishrj-bj/my-day",
+ "check": {
+  "v": 1,
+  "gz": true,
+  "iv": "z+Wv/0CUnUEYOUoW",
+  "ct": "6s0CrfmKjeARNLkV4Ey4O9EL7dEB8K0R8GZSltqfXfplbkyuYuuosHf474T2J2M="
+ }
+}
