@@ -397,11 +397,11 @@ async function gemini(prompt, { history = [], maxTokens = 1500, temperature = 0.
     try {
       const res = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent`, {
         method: "POST", headers: { "Content-Type": "application/json", "x-goog-api-key": key },
-        body: JSON.stringify({ systemInstruction: { parts: [{ text: PERSONA }] }, contents, generationConfig: { temperature, maxOutputTokens: maxTokens } }),
+        body: JSON.stringify({ systemInstruction: { parts: [{ text: PERSONA }] }, contents, generationConfig: { temperature, maxOutputTokens: Math.max(8192, maxTokens) } }),
       });
       const j = await res.json().catch(() => ({}));
       if (!res.ok) { last = j.error?.message || res.status; if (res.status === 400 && /API key/i.test(last)) break; continue; }
-      const text = (j.candidates?.[0]?.content?.parts || []).map((p) => p.text || "").join("").trim();
+      const text = (j.candidates?.[0]?.content?.parts || []).filter((p) => !p.thought).map((p) => p.text || "").join("").trim();
       if (text) return text;
       last = "empty answer";
     } catch (e) { last = e.message; }
