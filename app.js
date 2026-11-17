@@ -81,6 +81,7 @@ const STATE = {
   page: store.get("page", "today"),
   healthRange: 30,
   moneyCycle: 0,
+  moneyMonth: 0,
   workCycle: 0,
   txQuery: "",
   txCat: "",
@@ -170,7 +171,21 @@ const ghToken = () => (store.get("dev:github_token") || "").trim();
 const ghRepo = () => store.get("dev:github_repo") || MODE.keyinfo?.repo || "";
 
 /* ================================================================== domain */
-const NON_SPEND = new Set(["transfer", "savings", "investment", "self transfer"]);
+const NON_SPEND = new Set(["transfer", "savings", "investment", "duplicate", "self transfer"]);
+const GENERIC_CATS = new Set(["", "misc", "uncategorized", "uncategorised", "upi", "innofinsolut", "others", "other"]);
+const DEFAULT_CATS = [{ name: "Tea", emoji: "☕", slot: 2 }, { name: "Grocery", emoji: "🛒", slot: 3 }, { name: "Amazon", emoji: "📦", slot: 4 }, { name: "Bills", emoji: "🧾", slot: 1 }, { name: "Investment", emoji: "📈", slot: 5 }];
+const userCats = () => (Array.isArray(S().expense_categories) && S().expense_categories.length ? S().expense_categories : DEFAULT_CATS);
+const slotColor = (n) => (n >= 1 && n <= 8 ? `var(--c${n})` : "var(--ink-3)");
+const UNTAGGED = { name: "Untagged", emoji: "🏷️", slot: 0, untagged: true };
+const OTHER = { name: "Other", emoji: "💸", slot: 0, other: true };
+function catOf(e) {
+  const name = String(e.category || "").trim(), low = name.toLowerCase();
+  const u = userCats().find((c) => c.name.toLowerCase() === low);
+  if (u) return u;
+  if (GENERIC_CATS.has(low)) return UNTAGGED;
+  return OTHER;
+}
+const catBadge = (c, size = 30) => `<span class="catb" style="--cc:${slotColor(c.slot)};width:${size}px;height:${size}px;font-size:${Math.round(size * 0.52)}px" aria-hidden="true">${c.emoji || "💸"}</span>`;
 const S = () => DATA.settings || {};
 function index() {
   IDX.att = {}; (DATA.attendance || []).forEach((a) => { IDX.att[a.date] = a; });
@@ -227,7 +242,30 @@ function cycleLeave(c) {
   });
   return { taken: [...taken].sort(), planned: planned.sort(), total: taken.size + planned.length, limit: Number(S().casual_leave_limit || 1) };
 }
-const isSpend = (e) => e.type === "Debit" && !NON_SPEND.has(String(e.category || "").toLowerCase());
+const isSpend = (e) => e.type === "Debit" && !NON_SPEND.has(String(e.category || "").toLowerCase()) && e.dup !== "auto";
+function monthBounds(offset = 0) {
+  const d = new Date(); d.setDate(1); d.setMonth(d.getMonth() + offset);
+  const start = iso(d), endD = new Date(d.getFullYear(), d.getMonth() + 1, 0);
+  return { start, end: iso(endD), label: d.toLocaleDateString("en-GB", { month: "long", year: "numeric" }), short: MONTHS[d.getMonth()] };
+}
+function monthMoney(m) {
+  const rows = (DATA.expenses || []).filter((e) => inRange(e.date, m.start, m.end));
+  const spendRows = rows.filter(isSpend);
+  const spent = sum(spendRows, (e) => e.amount);
+  const invested = sum(rows.filter((e) => e.type === "Debit" && String(e.category || "").toLowerCase() === "investment" && e.dup !== "auto"), (e) => e.amount);
+  const income = Number(S().monthly_income || 50000);
+  const budget = Number(S().monthly_budget || 0);
+  const t = todayISO();
+  const daysLeft = t > m.end ? 0 : daysBetween(t < m.start ? m.start : t, m.end) + 1;
+  const groups = new Map();
+  userCats().filter((c) => c.name.toLowerCase() !== "investment").forEach((c) => groups.set(c.name, { cat: c, total: 0, n: 0 }));
+  groups.set("Other", { cat: OTHER, total: 0, n: 0 }); groups.set("Untagged", { cat: UNTAGGED, total: 0, n: 0 });
+  spendRows.forEach((e) => { const c = catOf(e); const g = groups.get(c.name) || groups.get("Other"); g.total += Number(e.amount || 0); g.n++; });
+  return { rows, spendRows, spent, invested, income, budget, left: income - spent - invested, budgetLeft: budget - spent, daysLeft,
+    safeDaily: daysLeft ? Math.max(budget - spent, 0) / daysLeft : 0, groups: [...groups.values()],
+    dupAuto: rows.filter((e) => e.dup === "auto"), dupCheck: rows.filter((e) => e.dup === "check"),
+    untagged: spendRows.filter((e) => catOf(e).untagged) };
+}
 function cycleMoney(c) {
   const rows = (DATA.expenses || []).filter((e) => inRange(e.date, c.start, c.end));
   const spendRows = rows.filter(isSpend);
@@ -285,10 +323,8 @@ function upcoming(limit = 4) {
   });
   return out.sort((a, b) => a.d.localeCompare(b.d)).slice(0, limit);
 }
-function categories() {
-  const set = new Set(["Food", "Groceries", "Dining", "Travel", "Fuel", "Bills", "Shopping", "Health", "Education", "Family", "Misc", "Transfer", "Savings"]);
-  (DATA.expenses || []).forEach((e) => e.category && set.add(e.category));
-  return [...set].sort((a, b) => a.localeCompare(b));
+function catChips(selected, act, extra = "") {
+  return `<div class="catchips" role="group" aria-label="Category">${userCats().map((c) => `<button type="button" class="catchip" style="--cc:${slotColor(c.slot)}" aria-pressed="${String(selected || "").toLowerCase() === c.name.toLowerCase()}" data-act="${act}" data-v="${esc(c.name)}" ${extra}>${c.emoji} ${esc(c.name)}</button>`).join("")}</div>`;
 }
 
 /* ================================================================== TickTick */
@@ -456,9 +492,15 @@ function applyLocal(route, p, entryId) {
   } else if (route === "/api/transaction") {
     const list = (DATA.expenses = DATA.expenses || []);
     if (p.action === "delete") DATA.expenses = list.filter((e) => String(e.id) !== String(p.id));
-    else if (p.action === "patch") { const e = list.find((x) => String(x.id) === String(p.id)); if (e) Object.assign(e, { category: p.category ?? e.category, notes: p.notes ?? e.notes }, { _edited: true }); }
+    else if (p.action === "patch") { const e = list.find((x) => String(x.id) === String(p.id)); if (e) { Object.assign(e, { category: p.category ?? e.category, notes: p.notes ?? e.notes }, { _edited: true }); if (p.category === "Duplicate") delete e.dup; } }
     else list.unshift({ id: "p-" + entryId, date: p.expense_date, amount: Number(p.amount), category: p.category, description: p.description, type: p.type || "Debit", account: p.account || "Cash", notes: p.notes || "", source_file: "Phone", ...tag });
     DATA.expenses.sort((a, b) => b.date.localeCompare(a.date));
+  } else if (route === "/api/transactions-bulk") {
+    const ids = new Set((p.ids || []).map(String));
+    (DATA.expenses || []).forEach((e) => { if (ids.has(String(e.id))) { e.category = p.category; e._edited = true; } });
+  } else if (route === "/api/settings") {
+    if (p.expense_categories) DATA.settings.expense_categories = p.expense_categories;
+    if (p.expense_dup_ok_add) { const ids = new Set(p.expense_dup_ok_add.map(String)); (DATA.expenses || []).forEach((e) => { if (ids.has(String(e.id))) delete e.dup; }); }
   } else if (route === "/api/petrol-fill") {
     (DATA.petrol = DATA.petrol || []).push({ id: 1e9 + (DATA.petrol.length), fill_date: p.fill_date, odometer_km: Number(p.odometer_km) || null, liters: Number(p.liters) || null, amount: Number(p.amount) || null, note: p.note || "", ...tag });
   } else if (route === "/api/calendar-item") {
@@ -494,7 +536,10 @@ async function submit(route, payload, okMsg = "Saved") {
     entry.sent = true; store.set("pending", pending);
     toast(`${okMsg}. It reaches the PC at the next sync.`);
   } catch (e) {
-    toast(e.message === "no-token" ? `${okMsg} on this phone. Add GitHub write access in Settings to send it to the PC.` : `Saved on this phone, sending failed: ${e.message}`, e.message === "no-token" ? "" : "error");
+    if (e.message === "no-token") {
+      toast(window._warnedNoToken ? `${okMsg} (on this phone)` : `${okMsg} on this phone. Add GitHub write access in Settings to send it to the PC.`);
+      window._warnedNoToken = true;
+    } else toast(`Saved on this phone, sending failed: ${e.message}`, "error");
   }
   render();
   return true;
@@ -527,7 +572,7 @@ function drawCharts() {
     const spec = CHARTS[el.dataset.chart];
     if (!spec) return;
     const w = el.clientWidth || 320, h = spec.height || 180;
-    el.innerHTML = spec.type === "line" ? lineSVG(spec, w, h) : barSVG(spec, w, h);
+    el.innerHTML = spec.type === "line" ? lineSVG(spec, w, h) : spec.type === "stack" ? stackSVG(spec, w, h) : barSVG(spec, w, h);
   });
 }
 function yAxis(max, w, h, m, fmt) {
@@ -678,7 +723,7 @@ function dayStrip() {
 function renderToday() {
   const s = S(), t = todayISO(), h = IDX.health[t] || {};
   const name = DATA.profile?.display_name || "";
-  const cw = cycleWork(cycleBounds(0)), cm = cycleMoney(cycleBounds(0));
+  const cw = cycleWork(cycleBounds(0)), cm = monthMoney(monthBounds(0));
   const spentToday = sum(cm.spendRows.filter((e) => e.date === t), (e) => e.amount);
   const stepsPct = clamp(((h.steps || 0) / (s.steps_goal || 8000)) * 100, 0, 100);
   const sleepPct = clamp(((h.sleep || 0) / ((s.sleep_goal_hours || 8) * 60)) * 100, 0, 100);
@@ -711,7 +756,7 @@ function renderToday() {
       <button class="vital" data-go="money">
         <span class="lab">${icon("wallet")}Spent today</span>
         <span class="val">${inr(spentToday)}</span>
-        <span class="sub">${cm.left > 0 ? `${inr(cm.safeDaily)} a day keeps you on budget` : `Over budget by ${inr(-cm.left)}`}</span>
+        <span class="sub">${cm.budgetLeft > 0 ? `${inr(cm.safeDaily)} a day keeps you on budget` : `Over budget by ${inr(-cm.budgetLeft)}`}</span>
       </button>
       <button class="vital" data-go="work">
         <span class="lab">${icon("clock")}Variance left</span>
@@ -721,7 +766,7 @@ function renderToday() {
     </div>
 
     <section class="card">
-      <div class="card-h"><h2>Due today</h2><button class="link" data-go="tasks">All tasks</button></div>
+      <div class="card-h"><h2>Due today</h2>${focusToday() ? `<span class="muted" style="font-size:.85rem">${focusToday()} min focused</span>` : ""}<button class="link" data-go="tasks">All tasks</button></div>
       ${ttToken() || TT.open.length ? (due.length ? `<div class="tasks">${due.slice(0, 7).map(taskRow).join("")}</div>${due.length > 7 ? `<p class="muted">${due.length - 7} more on the Tasks tab</p>` : ""}` : `<p class="soft">Nothing due today${g.week.length ? `. Next: ${esc(g.week[0].title)} (${esc(relDay(taskDay(g.week[0])))})` : ""}.</p>`)
       : `<div class="empty">Connect TickTick to see today's tasks here.<button class="btn sm" data-act="settings">Add TickTick token</button></div>`}
       ${ttToken() ? `<form class="quickadd" data-form="quick-task"><input type="text" name="title" placeholder="Add a task for today" aria-label="New task for today" autocomplete="off"><button class="btn primary" aria-label="Add task">${icon("plus")}</button></form>` : ""}
@@ -758,6 +803,17 @@ function checkinCard(c, evening) {
   </section>`;
 }
 
+function focusToday() { const d = (DATA.focus?.days || []).find((x) => x.day === todayISO()); return d ? Math.round(d.minutes || 0) : 0; }
+function focusCard() {
+  const t = todayISO(), days = Array.from({ length: 14 }, (_, i) => addDays(t, i - 13));
+  const by = Object.fromEntries((DATA.focus?.days || []).map((d) => [d.day, d]));
+  const total = sum(days, (d) => by[d]?.minutes || 0);
+  if (!total) return `<section class="card"><div class="card-h"><h2>Focus</h2></div><p class="soft">Start the desktop focus widget on the PC ("Focus Tracker.bat"). Each 20-minute block shows up here.</p></section>`;
+  return `<section class="card"><div class="card-h"><h2>Focus, last 14 days</h2><span class="num">${fmtHM(total)}</span></div>
+    ${chart({ type: "bar", height: 150, color: "var(--accent)", label: "Focus minutes per day", goal: 80, goalLabel: "4 blocks", yfmt: (v) => `${Math.round(v)}m`,
+      data: days.map((d) => ({ label: d, xl: String(parseISO(d).getDate()), v: by[d]?.minutes || 0, tip: `<b>${fmtDate(d, true)}</b><br>${by[d] ? `${Math.round(by[d].minutes)} min, ${by[d].blocks || 0} full blocks` : "No focus logged"}` })) })}
+  </section>`;
+}
 function renderTasks() {
   const g = taskGroups();
   const t = todayISO();
@@ -791,6 +847,7 @@ function renderTasks() {
       <div class="card-h"><h2>Open</h2><button class="link" data-act="tt-refresh">${icon("sync", "")} Refresh</button></div>
       ${TT.open.length ? section("Overdue", g.overdue) + section("Today", g.today) + section("Next 7 days", g.week) + section("Later", g.later) + section("No date", g.none) : `<p class="soft">No open tasks. Enjoy it.</p>`}
     </section>
+    ${focusCard()}
     <section class="card">
       <div class="card-h"><h2>Done in the last 14 days</h2><span class="num">${sum(days, (d) => doneBy[d] || 0)}</span></div>
       ${chart({ type: "bar", height: 150, color: "var(--accent)", label: "Tasks completed per day", minMax: 4, yfmt: (v) => fmtN(v), data: days.map((d) => ({ label: d, xl: String(parseISO(d).getDate()), v: doneBy[d] || 0, tip: `<b>${fmtDate(d, true)}</b><br>${doneBy[d] || 0} done` })) })}
@@ -885,48 +942,107 @@ function renderHealth() {
   </div>`;
 }
 
+function stackSVG(spec, w, h) {
+  const m = { t: 14, r: 8, b: 22, l: 44 }, data = spec.data;
+  const max = niceMax(Math.max(spec.ref || 0, ...data.map((d) => sum(d.segs, (s) => s.v))) * 1.05);
+  const iw = w - m.l - m.r, ih = h - m.t - m.b, step = iw / Math.max(1, data.length), bw = Math.min(46, step * 0.6);
+  const y = (v) => m.t + ih * (1 - v / max);
+  let s = `<svg viewBox="0 0 ${w} ${h}" width="${w}" height="${h}" role="img" aria-label="${esc(spec.label || "")}">`;
+  s += yAxis(max, w, h, m, spec.yfmt);
+  data.forEach((d, i) => {
+    const x0 = m.l + step * i + (step - bw) / 2;
+    let acc = 0;
+    const segs = d.segs.filter((sg) => sg.v > 0);
+    segs.forEach((sg, k) => {
+      const top = y(acc + sg.v), bot = y(acc), hgt = Math.max(0, bot - top - (k ? 2 : 0));
+      const r = k === segs.length - 1 ? Math.min(4, hgt) : 0;
+      s += r ? `<path d="M${x0},${top + hgt} V${top + r} Q${x0},${top} ${x0 + r},${top} H${x0 + bw - r} Q${x0 + bw},${top} ${x0 + bw},${top + r} V${top + hgt} Z" fill="${sg.color}"/>`
+             : `<rect x="${x0}" y="${top}" width="${bw}" height="${hgt}" fill="${sg.color}"/>`;
+      acc += sg.v;
+    });
+    s += `<rect class="hit" x="${m.l + step * i}" y="${m.t}" width="${step}" height="${ih}" data-tip="${esc(d.tip)}"/>`;
+    s += `<text class="axis" x="${m.l + step * i + step / 2}" y="${h - 4}" text-anchor="middle">${esc(d.xl)}</text>`;
+  });
+  if (spec.ref) { const ry = y(spec.ref); s += `<line class="goal" x1="${m.l}" x2="${w - m.r}" y1="${ry}" y2="${ry}"/><text class="goal-l" x="${w - m.r}" y="${ry - 5}" text-anchor="end">${esc(spec.refLabel || "")}</text>`; }
+  return s + "</svg>";
+}
+const CREDIT = { name: "Money in", emoji: "💰", slot: 7 };
+function txRow(e) {
+  const c = e.type === "Credit" ? CREDIT : catOf(e);
+  const flag = e.dup === "auto" ? `<span class="pill bad" style="margin-right:6px">${icon("alert")}Duplicate, not counted</span>` : e.dup === "check" ? `<span class="pill warn" style="margin-right:6px">${icon("alert")}Duplicate?</span>` : "";
+  return `<button class="li tx ${e._pending ? "pending" : ""} ${e.dup === "auto" ? "dupe" : ""}" data-act="tx" data-id="${esc(e.id)}">${catBadge(c, 34)}<div class="a"><b>${esc(e.description || "Transaction")}</b><span>${flag}${esc(e.type === "Credit" ? "Money in" : c.untagged || c.other ? (e.category || "Untagged") : c.name)} · ${esc(relDay(e.date))}${e.notes ? ` · ${esc(e.notes)}` : ""}</span></div><div class="z" style="${e.type === "Credit" ? "color:var(--good)" : ""}">${e.type === "Credit" ? "+" : ""}${inr(e.amount)}<small>${esc(e.account || "")}</small></div></button>`;
+}
 function renderMoney() {
-  const c = cycleBounds(STATE.moneyCycle), cm = cycleMoney(c), t = todayISO();
-  const days = []; for (let d = c.start; d <= c.end; d = addDays(d, 1)) days.push(d);
+  const mb = monthBounds(STATE.moneyMonth || 0), mm = monthMoney(mb), t = todayISO();
+  const days = []; for (let d = mb.start; d <= mb.end; d = addDays(d, 1)) days.push(d);
   let run = 0;
-  const cum = days.map((d) => { if (d > t) return null; run += sum(cm.spendRows.filter((e) => e.date === d), (e) => e.amount); return run; });
-  const pace = days.map((_, i) => (cm.budget * (i + 1)) / days.length);
-  const idxToday = days.indexOf(t), expected = idxToday >= 0 ? pace[idxToday] : cm.budget;
-  const ahead = cm.spent - expected;
-  const tone = cm.left < 0 ? "bad" : ahead > cm.budget * 0.05 ? "warn" : "good";
-  const cats = Object.entries(cm.byCat).sort((a, b) => b[1] - a[1]);
-  const top = cats[0]?.[1] || 1;
+  const cum = days.map((d) => { if (d > t) return null; run += sum(mm.spendRows.filter((e) => e.date === d), (e) => e.amount); return run; });
+  const pace = days.map((_, i) => (mm.budget * (i + 1)) / days.length);
+  const groups = mm.groups.filter((g) => g.total > 0 || !g.cat.other && !g.cat.untagged).sort((a, b) => b.total - a.total);
+  const top = Math.max(1, ...groups.map((g) => g.total));
+  const segs = groups.filter((g) => g.total > 0);
   const q = STATE.txQuery.toLowerCase();
-  const tx = cm.rows.filter((e) => (!STATE.txCat || (e.category || "Uncategorised") === STATE.txCat) && (!q || `${e.description} ${e.category} ${e.notes} ${e.account}`.toLowerCase().includes(q)));
+  const tx = mm.rows.filter((e) => (!STATE.txCat || catOf(e).name === STATE.txCat) && (!q || `${e.description} ${e.category} ${e.notes} ${e.account}`.toLowerCase().includes(q)));
   const ps = petrolStats();
+  // last 6 months, stacked by category
+  const months = Array.from({ length: 6 }, (_, i) => monthBounds((STATE.moneyMonth || 0) - 5 + i));
+  const stackCats = [...userCats().filter((c) => c.name.toLowerCase() !== "investment"), OTHER, UNTAGGED];
+  const stackData = months.map((m) => { const x = monthMoney(m); return { xl: m.short, segs: stackCats.map((c) => ({ v: (x.groups.find((g) => g.cat.name === c.name) || {}).total || 0, color: c.untagged ? "color-mix(in srgb, var(--ink-3) 45%, transparent)" : slotColor(c.slot), name: c.name })),
+    tip: `<b>${m.label}</b><br>Spent ${inr(x.spent)}${x.invested ? `<br>Invested ${inr(x.invested)}` : ""}<br>${x.groups.filter((g) => g.total).sort((a, b) => b.total - a.total).slice(0, 5).map((g) => `${g.cat.emoji} ${g.cat.name} ${inr(g.total)}`).join("<br>")}` }; });
+  const smallUpi = mm.untagged.filter((e) => Number(e.amount) <= 30);
+  const tea = userCats().find((c) => c.name.toLowerCase() === "tea");
+  const dupGroups = mm.dupCheck;
+  const dupRow = (e) => `<div class="triage"><div class="a"><b>${inr(e.amount)} <span class="muted">${esc(e.description || "")}</span></b><span>${esc(fmtDate(e.date, true))} · ${esc(e.account || "")} · ${e.dup === "auto" ? "FinArt recorded this payment twice. Not counted." : "Same day, amount and description as another payment. Still counted."}</span></div>
+        <div class="btnrow"><button class="btn sm ${e.dup === "auto" ? "ghost" : "danger"}" data-act="dup-yes" data-id="${esc(e.id)}">It's a duplicate</button><button class="btn sm ghost" data-act="dup-ok" data-id="${esc(e.id)}">Not a duplicate</button></div></div>`;
   return `<div class="page">
     <div class="page-h"><h1>Money</h1>
-      <div class="btnrow" style="align-items:center"><button class="btn sm ghost" data-act="mc" data-v="-1" aria-label="Previous cycle">‹</button><span class="soft">${esc(fmtDate(c.start))} to ${esc(fmtDate(c.end))}</span><button class="btn sm ghost" data-act="mc" data-v="1" aria-label="Next cycle" ${STATE.moneyCycle >= 0 ? "disabled" : ""}>›</button></div>
+      <div class="btnrow" style="align-items:center"><button class="btn sm ghost" data-act="mm" data-v="-1" aria-label="Previous month">‹</button><span class="soft" style="min-width:9em;text-align:center">${esc(mb.label)}</span><button class="btn sm ghost" data-act="mm" data-v="1" aria-label="Next month" ${(STATE.moneyMonth || 0) >= 0 ? "disabled" : ""}>›</button><button class="btn sm ghost" data-act="cats">${icon("plus")}Categories</button></div>
     </div>
     <section class="card">
-      <div class="card-h"><h2>Budget</h2>${pill(tone, tone === "good" ? "ok" : "alert", tone === "good" ? "Within pace" : tone === "warn" ? `${inr(ahead)} ahead of pace` : "Over budget")}</div>
-      <p><span class="num" style="font-size:2rem;font-weight:800">${inr(cm.spent)}</span> <span class="soft">of ${inr(cm.budget)}</span></p>
+      <div class="card-h"><h2>Stipend</h2><span class="num soft">${inr(mm.income)}</span></div>
+      <div class="incomebar" role="img" aria-label="How the ${inr(mm.income)} stipend is used">${segs.map((g) => `<i style="width:${(g.total / Math.max(mm.income, mm.spent + mm.invested)) * 100}%;background:${g.cat.untagged ? "repeating-linear-gradient(135deg,var(--ink-3) 0 4px,var(--surface-3) 4px 8px)" : slotColor(g.cat.slot)}" data-tip="${esc(`${g.cat.emoji} <b>${g.cat.name}</b><br>${inr(g.total)}`)}"></i>`).join("")}${mm.invested ? `<i style="width:${(mm.invested / Math.max(mm.income, mm.spent + mm.invested)) * 100}%;background:${slotColor((userCats().find((c) => c.name.toLowerCase() === "investment") || {}).slot || 5)}" data-tip="${esc(`📈 <b>Invested</b><br>${inr(mm.invested)}`)}"></i>` : ""}</div>
       <div class="stats">
-        <div class="stat"><span class="k">Left</span><span class="v">${inr(cm.left)}</span></div>
-        <div class="stat"><span class="k">Per day left</span><span class="v">${STATE.moneyCycle === 0 ? inr(cm.safeDaily) : "–"}</span></div>
-        <div class="stat"><span class="k">Money in</span><span class="v">${compactINR(cm.income)}</span></div>
+        <div class="stat"><span class="k">Spent</span><span class="v">${inr(mm.spent)}</span></div>
+        <div class="stat"><span class="k">Invested</span><span class="v">${inr(mm.invested)}</span></div>
+        <div class="stat"><span class="k">${mm.left >= 0 ? "Left" : "Over"}</span><span class="v" style="color:${mm.left >= 0 ? "var(--good)" : "var(--bad)"}">${inr(Math.abs(mm.left))}</span></div>
       </div>
-      <div class="legend"><span><i style="background:var(--s-spend)"></i>Spent so far</span><span><i class="dash"></i>Even pace to ${compactINR(cm.budget)}</span></div>
-      ${chart({ type: "line", height: 180, label: "Cumulative spending against an even budget pace", x: days.map((d) => String(parseISO(d).getDate())), yfmt: compactINR,
-        series: [{ values: pace, color: "var(--s-budget)", dash: true }, { values: cum, color: "var(--s-spend)", endLabel: compactINR(cm.spent) }],
-        tip: (i) => `<b>${fmtDate(days[i], true)}</b><br>${cum[i] != null ? `Spent ${inr(cum[i])}<br>` : ""}Pace ${inr(pace[i])}` })}
-      <p class="muted" style="font-size:.8rem">Transfers and savings are not counted as spending. FinArt synced ${esc(sinceText(DATA.sync?.finart))}.</p>
+      ${mm.dupAuto.length ? `<p class="muted" style="font-size:.82rem">${mm.dupAuto.length} FinArt double entr${mm.dupAuto.length === 1 ? "y" : "ies"} (${inr(sum(mm.dupAuto, (e) => e.amount))}) left out of these totals.</p>` : ""}
     </section>
     <section class="card">
-      <div class="card-h"><h2>Where it went</h2></div>
-      ${cats.length ? cats.slice(0, 8).map(([k, v]) => `<button class="hbar" style="background:none;border:0;padding:4px 0;text-align:left" data-act="cat" data-v="${esc(k)}"><span class="nm">${esc(k)}</span><span class="bar"><i style="width:${(v / top) * 100}%"></i></span><span class="vv">${inr(v)}</span></button>`).join("") : `<p class="soft">No spending yet this cycle.</p>`}
+      <div class="card-h"><h2>By category</h2>${STATE.txCat ? `<button class="link" data-act="cat" data-v="">Show all</button>` : ""}</div>
+      ${groups.map((g) => `<button class="catrow ${STATE.txCat === g.cat.name ? "on" : ""}" data-act="cat" data-v="${esc(g.cat.name)}">${catBadge(g.cat, 34)}<span class="nm"><b>${esc(g.cat.name)}</b><small>${g.n ? `${g.n} payment${g.n === 1 ? "" : "s"}` : "nothing yet"}${mm.spent && g.total ? ` · ${Math.round((g.total / mm.spent) * 100)}%` : ""}</small><span class="bar"><i style="width:${(g.total / top) * 100}%;background:${g.cat.untagged ? "repeating-linear-gradient(135deg,var(--ink-3) 0 4px,transparent 4px 8px)" : slotColor(g.cat.slot)}"></i></span></span><span class="vv">${inr(g.total)}</span></button>`).join("")}
     </section>
+    ${mm.untagged.length ? `<section class="card">
+      <div class="card-h"><h2>Needs a category</h2><span class="muted" style="font-size:.85rem">${mm.untagged.length} payments</span></div>
+      <p class="muted" style="font-size:.85rem">FinArt only says "UPI" for most payments. Tap a category to sort each one.</p>
+      ${smallUpi.length && tea ? `<button class="btn ghost sm" data-act="bulk" data-v="${esc(tea.name)}" data-ids="${smallUpi.map((e) => e.id).join(",")}">${tea.emoji} Mark all ${smallUpi.length} payments of ₹30 or less as ${esc(tea.name)}</button>` : ""}
+      <div class="list">${mm.untagged.slice(0, STATE.triageAll ? 200 : 6).map((e) => `<div class="triage"><div class="a"><b>${inr(e.amount)} <span class="muted">${esc(e.description || "")}</span></b><span>${esc(relDay(e.date))} · ${esc(e.account || "")}</span></div>${catChips("", "cat-set", `data-id="${esc(e.id)}"`)}</div>`).join("")}</div>
+      ${mm.untagged.length > 6 && !STATE.triageAll ? `<button class="btn ghost" data-act="triage-all">Show all ${mm.untagged.length}</button>` : ""}
+    </section>` : ""}
+    ${dupGroups.length || mm.dupAuto.length ? `<section class="card">
+      <div class="card-h"><h2>Duplicates</h2><span class="muted" style="font-size:.85rem">${dupGroups.length ? `${dupGroups.length} to check` : "all handled"}</span></div>
+      ${dupGroups.length ? `<div class="list">${dupGroups.map(dupRow).join("")}</div>` : ""}
+      ${mm.dupAuto.length ? `<details class="more"><summary>${mm.dupAuto.length} FinArt double entr${mm.dupAuto.length === 1 ? "y" : "ies"} hidden automatically (${inr(sum(mm.dupAuto, (e) => e.amount))})</summary><div class="list">${mm.dupAuto.map(dupRow).join("")}</div></details>` : ""}
+    </section>` : ""}
+    <section class="card">
+      <div class="card-h"><h2>Month by month</h2></div>
+      <div class="legend">${stackCats.filter((c) => stackData.some((d) => d.segs.find((s) => s.name === c.name)?.v)).map((c) => `<span><i style="background:${c.untagged ? "color-mix(in srgb, var(--ink-3) 45%, transparent)" : slotColor(c.slot)};height:10px;width:10px;border-radius:3px"></i>${c.emoji} ${esc(c.name)}</span>`).join("")}</div>
+      ${chart({ type: "stack", height: 200, label: "Spending per month by category", data: stackData, yfmt: compactINR, ref: mm.income, refLabel: `Stipend ${compactINR(mm.income)}` })}
+    </section>
+    ${(STATE.moneyMonth || 0) === 0 && mm.budget ? `<section class="card">
+      <div class="card-h"><h2>Budget pace</h2><span class="soft" style="font-size:.85rem">${mm.budgetLeft > 0 ? `${inr(mm.safeDaily)} a day left` : `Over by ${inr(-mm.budgetLeft)}`}</span></div>
+      <div class="legend"><span><i style="background:var(--s-spend)"></i>Spent so far</span><span><i class="dash"></i>Even pace to ${compactINR(mm.budget)}</span></div>
+      ${chart({ type: "line", height: 170, label: "Cumulative spending against an even budget pace", x: days.map((d) => String(parseISO(d).getDate())), yfmt: compactINR,
+        series: [{ values: pace, color: "var(--s-budget)", dash: true }, { values: cum, color: "var(--s-spend)", endLabel: compactINR(mm.spent) }],
+        tip: (i) => `<b>${fmtDate(days[i], true)}</b><br>${cum[i] != null ? `Spent ${inr(cum[i])}<br>` : ""}Pace ${inr(pace[i])}` })}
+    </section>` : ""}
     <section class="card">
       <div class="card-h"><h2>Transactions</h2><button class="link" data-act="expense">${icon("plus")} Add</button></div>
       <input type="search" placeholder="Search merchant, category, note" value="${esc(STATE.txQuery)}" data-input="txq" aria-label="Search transactions">
       ${STATE.txCat ? `<div class="chips"><button class="chip" aria-pressed="true" data-act="cat" data-v="">${esc(STATE.txCat)} ✕</button></div>` : ""}
-      <div class="list">${tx.slice(0, STATE.txAll ? 300 : 15).map((e) => `<button class="li ${e._pending ? "pending" : ""}" data-act="tx" data-id="${esc(e.id)}"><div class="a"><b>${esc(e.description || "Transaction")}</b><span>${esc(e.category || "Uncategorised")} · ${esc(relDay(e.date))}${e.notes ? ` · ${esc(e.notes)}` : ""}</span></div><div class="z" style="${e.type === "Credit" ? "color:var(--good)" : ""}">${e.type === "Credit" ? "+" : ""}${inr(e.amount)}<small>${esc(e.account || "")}</small></div></button>`).join("") || `<p class="soft">No transactions match.</p>`}</div>
+      <div class="list">${tx.slice(0, STATE.txAll ? 400 : 15).map(txRow).join("") || `<p class="soft">No transactions match.</p>`}</div>
       ${tx.length > 15 && !STATE.txAll ? `<button class="btn ghost" data-act="tx-all">Show all ${tx.length}</button>` : ""}
+      <p class="muted" style="font-size:.8rem">Income counts only the ${inr(mm.income)} stipend. Transfers, savings and duplicates are left out of spending. FinArt synced ${esc(sinceText(DATA.sync?.finart))}.</p>
     </section>
     <section class="card">
       <div class="card-h"><h2>Petrol</h2><button class="link" data-act="petrol">${icon("plus")} Log fill</button></div>
@@ -957,8 +1073,8 @@ function expenseSheet() {
     <form data-form="expense" class="page" style="padding:0;gap:12px">
       <div class="row2"><label class="f">Amount (₹)<input type="number" name="amount" inputmode="decimal" step="0.01" min="0" required></label><label class="f">Date<input type="date" name="expense_date" value="${todayISO()}" required></label></div>
       <label class="f">What was it?<input type="text" name="description" placeholder="Merchant or note" required></label>
-      <div class="row2"><label class="f">Category<select name="category">${categories().map((c) => `<option ${c === "Misc" ? "selected" : ""}>${esc(c)}</option>`).join("")}</select></label>
-      <label class="f">Type<select name="type"><option>Debit</option><option>Credit</option></select></label></div>
+      <div class="f" style="display:grid;gap:6px;font-size:.85rem;color:var(--ink-2)">Category<input type="hidden" name="category" value="">${catChips("", "pick-cat")}</div>
+      <label class="f">Type<select name="type"><option>Debit</option><option>Credit</option></select></label>
       <label class="f">Paid from<input type="text" name="account" value="Cash"></label>
       <button class="btn primary">Save transaction</button>
     </form>`);
@@ -969,11 +1085,25 @@ function txSheet(id) {
   const canEdit = !e._pending;
   openSheet(`${sheetHead(e.description || "Transaction")}
     <dl class="kv"><dt>Amount</dt><dd class="num">${e.type === "Credit" ? "+" : ""}${inr(e.amount, 2)}</dd><dt>Date</dt><dd>${esc(fmtDate(e.date, true))}</dd><dt>Account</dt><dd>${esc(e.account || "–")}</dd><dt>Source</dt><dd>${esc(e.source_file === "finart_web_sync" ? "FinArt" : e.source_file || "–")}</dd></dl>
+    ${e.dup ? `<div class="banner">${icon("alert")}<span>${e.dup === "auto" ? "FinArt recorded this payment twice, so this copy is left out of totals." : "Looks like a duplicate of another payment on the same day."}</span></div><div class="btnrow"><button class="btn sm danger" data-act="dup-yes" data-id="${esc(e.id)}">It's a duplicate</button><button class="btn sm ghost" data-act="dup-ok" data-id="${esc(e.id)}">Not a duplicate</button></div>` : ""}
     ${canEdit ? `<form data-form="tx-patch" data-id="${esc(e.id)}" class="page" style="padding:0;gap:12px">
-      <label class="f">Category<select name="category">${categories().map((c) => `<option ${c === e.category ? "selected" : ""}>${esc(c)}</option>`).join("")}</select></label>
+      <div class="f" style="display:grid;gap:6px;font-size:.85rem;color:var(--ink-2)">Category<input type="hidden" name="category" value="${esc(e.category || "")}">${catChips(e.category, "pick-cat")}</div>
       <label class="f">Note<input type="text" name="notes" value="${esc(e.notes || "")}"></label>
       <button class="btn primary">Save changes</button>
     </form>` : `<p class="soft">This entry is still on its way to the PC. You can edit it after the next sync.</p>`}`);
+}
+const EMOJIS = ["☕", "🛒", "📦", "🧾", "📈", "🍽️", "🚌", "⛽", "🏥", "🎓", "👨‍👩‍👦", "🎁", "📱", "🎬", "👕", "🏠", "💊", "✈️", "🐟", "💸"];
+function catsSheet() {
+  const cats = userCats(), used = new Set(cats.map((c) => c.slot)), free = [1, 2, 3, 4, 5, 6, 7, 8].find((n) => !used.has(n)) || 0;
+  openSheet(`${sheetHead("Categories")}
+    <div class="list">${cats.map((c, i) => `<div class="li">${catBadge(c, 34)}<div class="a" style="padding-left:10px"><b>${esc(c.name)}</b><span>${sum((DATA.expenses || []).filter((e) => catOf(e).name === c.name), (e) => 1)} transactions</span></div><button class="btn sm ghost" data-act="cat-del" data-i="${i}" aria-label="Remove ${esc(c.name)}">Remove</button></div>`).join("")}</div>
+    <form data-form="cat-add" class="page" style="padding:0;gap:10px">
+      <label class="f">New category<input type="text" name="name" maxlength="24" placeholder="e.g. Food, Travel, Family" required></label>
+      <input type="hidden" name="emoji" value="💸"><input type="hidden" name="slot" value="${free}">
+      <div class="emojis" role="group" aria-label="Emoji">${EMOJIS.map((em) => `<button type="button" class="emo" data-act="pick-emoji" data-v="${em}" aria-pressed="${em === "💸"}">${em}</button>`).join("")}</div>
+      <p class="muted" style="font-size:.82rem">${free ? "It gets the next free colour." : "All 8 colours are in use, so it will be grey."} Removing a category doesn't change past transactions; they show as Other.</p>
+      <button class="btn primary">Add category</button>
+    </form>`);
 }
 function petrolSheet(date = todayISO()) {
   const last = IDX.fuel[IDX.fuel.length - 1];
@@ -1128,6 +1258,29 @@ document.addEventListener("click", async (ev) => {
     case "wc": STATE.workCycle = Math.min(0, STATE.workCycle + Number(v)); render(); break;
     case "mc": STATE.moneyCycle = Math.min(0, STATE.moneyCycle + Number(v)); render(); break;
     case "tx-all": STATE.txAll = true; render(); break;
+    case "triage-all": STATE.triageAll = true; render(); break;
+    case "mm": STATE.moneyMonth = Math.min(0, (STATE.moneyMonth || 0) + Number(v)); STATE.txCat = ""; STATE.txAll = false; render(); break;
+    case "cats": catsSheet(); break;
+    case "pick-cat": {
+      const f = el.closest("form"); if (!f) break;
+      f.querySelector('[name="category"]').value = v;
+      $$('[data-act="pick-cat"]', f).forEach((b) => b.setAttribute("aria-pressed", b === el));
+      break;
+    }
+    case "pick-emoji": {
+      const f = el.closest("form"); f.querySelector('[name="emoji"]').value = v;
+      $$('[data-act="pick-emoji"]', f).forEach((b) => b.setAttribute("aria-pressed", b === el));
+      break;
+    }
+    case "cat-set": await submit("/api/transaction", { action: "patch", id: Number(el.dataset.id), category: v }, `Moved to ${v}`); break;
+    case "bulk": await submit("/api/transactions-bulk", { ids: el.dataset.ids.split(",").map(Number), category: v }, `Marked as ${v}`); break;
+    case "dup-yes": closeSheet(); await submit("/api/transaction", { action: "patch", id: Number(el.dataset.id), category: "Duplicate" }, "Marked as duplicate"); break;
+    case "dup-ok": closeSheet(); await submit("/api/settings", { expense_dup_ok_add: [el.dataset.id] }, "Kept as a real payment"); break;
+    case "cat-del": {
+      const cats = userCats().filter((_, i) => i !== Number(el.dataset.i));
+      if (!cats.length) { toast("Keep at least one category.", "error"); break; }
+      closeSheet(); await submit("/api/settings", { expense_categories: cats }, "Category removed"); break;
+    }
     case "cat": STATE.txCat = v || ""; render(); break;
     case "expense": expenseSheet(); break;
     case "tx": txSheet(el.dataset.id); break;
@@ -1193,7 +1346,14 @@ document.addEventListener("submit", async (ev) => {
       await submit("/api/checkin", payload, "Check-in saved");
     } else if (kind === "expense") {
       if (!(Number(fd.amount) > 0)) throw new Error("Enter an amount above zero.");
+      if (!fd.category) fd.category = "Uncategorized";
       closeSheet(); await submit("/api/transaction", fd, "Transaction saved");
+    } else if (kind === "cat-add") {
+      const name = (fd.name || "").trim();
+      if (!name) throw new Error("Give the category a name.");
+      if (userCats().some((c) => c.name.toLowerCase() === name.toLowerCase())) throw new Error("That category already exists.");
+      const cats = [...userCats(), { name, emoji: fd.emoji || "💸", slot: Number(fd.slot) || 0 }];
+      closeSheet(); await submit("/api/settings", { expense_categories: cats }, `Added ${name}`);
     } else if (kind === "tx-patch") {
       closeSheet(); await submit("/api/transaction", { action: "patch", id: Number(f.dataset.id), category: fd.category, notes: fd.notes }, "Transaction updated");
     } else if (kind === "petrol") {
